@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/db';
-import { users } from '@/db/schema';
-import { eq } from 'drizzle-orm';
+import { connectDB } from '@/db/mongodb';
+import { User } from '@/db/models/User';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
@@ -13,6 +12,9 @@ const JWT_EXPIRATION = '7d';
 
 export async function POST(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const body = await request.json();
     const { name, email, password, role, department } = body;
 
@@ -95,14 +97,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check if email already exists
-    const existingUser = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, sanitizedEmail))
-      .limit(1);
+    // Check if email already exists using Mongoose
+    const existingUser = await User.findOne({ 
+      email: sanitizedEmail 
+    }).exec();
 
-    if (existingUser.length > 0) {
+    if (existingUser) {
       return NextResponse.json(
         {
           error: 'Email already exists',
@@ -115,20 +115,16 @@ export async function POST(request: NextRequest) {
     // Hash password
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-    // Create user
-    const newUser = await db
-      .insert(users)
-      .values({
-        name: sanitizedName,
-        email: sanitizedEmail,
-        password: hashedPassword,
-        role: role,
-        department: sanitizedDepartment,
-        createdAt: new Date().toISOString()
-      })
-      .returning();
+    // Create user using Mongoose
+    const newUser = await User.create({
+      name: sanitizedName,
+      email: sanitizedEmail,
+      password: hashedPassword,
+      role: role,
+      department: sanitizedDepartment,
+    });
 
-    if (!newUser || newUser.length === 0) {
+    if (!newUser) {
       return NextResponse.json(
         {
           error: 'Failed to create user',
@@ -138,17 +134,16 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const createdUser = newUser[0];
-
     // Remove password from response
-    const { password: _, ...userWithoutPassword } = createdUser;
+    const userObject = newUser.toObject();
+    const { password: _, ...userWithoutPassword } = userObject;
 
     // Generate JWT token
     const token = jwt.sign(
       {
-        userId: createdUser.id,
-        email: createdUser.email,
-        role: createdUser.role
+        userId: newUser._id.toString(),
+        email: newUser.email,
+        role: newUser.role
       },
       JWT_SECRET,
       { expiresIn: JWT_EXPIRATION }

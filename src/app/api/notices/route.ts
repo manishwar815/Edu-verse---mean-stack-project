@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/db';
-import { notices, users } from '@/db/schema';
-import { eq, and, desc } from 'drizzle-orm';
+import { connectDB } from '@/db/mongodb';
+import { Notice } from '@/db/models/Notice';
+import { User } from '@/db/models/User';
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 interface JWTPayload {
-  userId: number;
+  userId: string;
   email: string;
   role: string;
 }
@@ -32,47 +32,51 @@ function verifyToken(request: NextRequest): JWTPayload | null {
 
 export async function GET(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const searchParams = request.nextUrl.searchParams;
     const department = searchParams.get('department');
     const year = searchParams.get('year');
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 100);
     const offset = parseInt(searchParams.get('offset') || '0');
 
-    let query = db
-      .select({
-        id: notices.id,
-        title: notices.title,
-        content: notices.content,
-        department: notices.department,
-        year: notices.year,
-        createdBy: notices.createdBy,
-        createdAt: notices.createdAt,
-        creator: {
-          id: users.id,
-          name: users.name,
-          email: users.email,
-          role: users.role,
-        },
-      })
-      .from(notices)
-      .leftJoin(users, eq(notices.createdBy, users.id))
-      .orderBy(desc(notices.createdAt));
-
-    const conditions = [];
+    // Build query filter for Mongoose
+    const filter: any = {};
     if (department) {
-      conditions.push(eq(notices.department, department));
+      filter.department = department;
     }
     if (year) {
-      conditions.push(eq(notices.year, year));
+      filter.year = year;
     }
 
-    if (conditions.length > 0) {
-      query = query.where(and(...conditions)) as any;
-    }
+    // Query notices with populate for creator details
+    const results = await Notice.find(filter)
+      .populate('createdBy', 'name email role')
+      .sort({ createdAt: -1 })
+      .skip(offset)
+      .limit(limit)
+      .lean()
+      .exec();
 
-    const results = await query.limit(limit).offset(offset);
+    // Transform results to match expected format
+    const formattedResults = results.map((notice: any) => ({
+      id: notice._id.toString(),
+      title: notice.title,
+      content: notice.content,
+      department: notice.department,
+      year: notice.year,
+      createdBy: notice.createdBy._id.toString(),
+      createdAt: notice.createdAt,
+      creator: {
+        id: notice.createdBy._id.toString(),
+        name: notice.createdBy.name,
+        email: notice.createdBy.email,
+        role: notice.createdBy.role,
+      },
+    }));
 
-    return NextResponse.json(results, { status: 200 });
+    return NextResponse.json(formattedResults, { status: 200 });
   } catch (error) {
     console.error('GET error:', error);
     return NextResponse.json(
@@ -84,6 +88,9 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const user = verifyToken(request);
 
     if (!user) {
@@ -144,40 +151,35 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const newNotice = await db
-      .insert(notices)
-      .values({
-        title: title.trim(),
-        content: content.trim(),
-        department: department.trim(),
-        year: year.trim(),
-        createdBy: user.userId,
-        createdAt: new Date().toISOString(),
-      })
-      .returning();
+    // Create notice using Mongoose
+    const newNotice = await Notice.create({
+      title: title.trim(),
+      content: content.trim(),
+      department: department.trim(),
+      year: year.trim(),
+      createdBy: user.userId,
+    });
 
-    const createdNoticeWithCreator = await db
-      .select({
-        id: notices.id,
-        title: notices.title,
-        content: notices.content,
-        department: notices.department,
-        year: notices.year,
-        createdBy: notices.createdBy,
-        createdAt: notices.createdAt,
-        creator: {
-          id: users.id,
-          name: users.name,
-          email: users.email,
-          role: users.role,
-        },
-      })
-      .from(notices)
-      .leftJoin(users, eq(notices.createdBy, users.id))
-      .where(eq(notices.id, newNotice[0].id))
-      .limit(1);
+    // Populate creator info
+    await newNotice.populate('createdBy', 'name email role');
 
-    return NextResponse.json(createdNoticeWithCreator[0], { status: 201 });
+    const formattedNotice = {
+      id: newNotice._id.toString(),
+      title: newNotice.title,
+      content: newNotice.content,
+      department: newNotice.department,
+      year: newNotice.year,
+      createdBy: (newNotice.createdBy as any)._id.toString(),
+      createdAt: newNotice.createdAt,
+      creator: {
+        id: (newNotice.createdBy as any)._id.toString(),
+        name: (newNotice.createdBy as any).name,
+        email: (newNotice.createdBy as any).email,
+        role: (newNotice.createdBy as any).role,
+      },
+    };
+
+    return NextResponse.json(formattedNotice, { status: 201 });
   } catch (error) {
     console.error('POST error:', error);
     return NextResponse.json(

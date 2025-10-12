@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/db';
-import { users } from '@/db/schema';
-import { eq, sql } from 'drizzle-orm';
+import { connectDB } from '@/db/mongodb';
+import { User } from '@/db/models/User';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
 export async function POST(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const body = await request.json();
     const { email, password } = body;
 
@@ -24,14 +26,12 @@ export async function POST(request: NextRequest) {
     // Sanitize and normalize email
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Find user by email (case-insensitive)
-    const userResult = await db
-      .select()
-      .from(users)
-      .where(sql`lower(${users.email}) = ${normalizedEmail}`)
-      .limit(1);
+    // Find user by email (case-insensitive using Mongoose)
+    const user = await User.findOne({ 
+      email: normalizedEmail 
+    }).exec();
 
-    if (userResult.length === 0) {
+    if (!user) {
       return NextResponse.json(
         { 
           error: 'Invalid credentials',
@@ -40,8 +40,6 @@ export async function POST(request: NextRequest) {
         { status: 401 }
       );
     }
-
-    const user = userResult[0];
 
     // Compare password with hashed password
     const isPasswordValid = await bcrypt.compare(password, user.password);
@@ -60,7 +58,7 @@ export async function POST(request: NextRequest) {
     const jwtSecret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
     const token = jwt.sign(
       {
-        userId: user.id,
+        userId: user._id.toString(),
         email: user.email,
         role: user.role
       },
@@ -69,7 +67,8 @@ export async function POST(request: NextRequest) {
     );
 
     // Return user object without password and JWT token
-    const { password: _, ...userWithoutPassword } = user;
+    const userObject = user.toObject();
+    const { password: _, ...userWithoutPassword } = userObject;
 
     return NextResponse.json(
       {

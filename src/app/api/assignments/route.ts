@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import jwt from 'jsonwebtoken';
-import { db } from '@/db';
-import { assignments, users, submissions } from '@/db/schema';
-import { eq, and, asc, sql } from 'drizzle-orm';
+import { connectDB } from '@/db/mongodb';
+import { Assignment } from '@/db/models/Assignment';
+import { User } from '@/db/models/User';
+import { Submission } from '@/db/models/Submission';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 interface JWTPayload {
-  userId: number;
+  userId: string;
   email: string;
   role: string;
   department?: string;
@@ -31,6 +32,9 @@ function verifyToken(request: NextRequest): JWTPayload | null {
 
 export async function GET(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const user = verifyToken(request);
     if (!user) {
       return NextResponse.json({ 
@@ -45,103 +49,71 @@ export async function GET(request: NextRequest) {
     const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 100);
     const offset = parseInt(searchParams.get('offset') || '0');
 
-    // Get user details to check role and department
-    const userDetails = await db.select()
-      .from(users)
-      .where(eq(users.id, user.userId))
-      .limit(1);
+    // Get user details to check role and department using Mongoose
+    const userDetails = await User.findById(user.userId).exec();
 
-    if (userDetails.length === 0) {
+    if (!userDetails) {
       return NextResponse.json({ 
         error: 'User not found',
         code: 'USER_NOT_FOUND' 
       }, { status: 404 });
     }
 
-    const currentUser = userDetails[0];
+    const currentUser = userDetails;
 
-    // Build base query with JOIN to get creator info and submission count
-    let query = db
-      .select({
-        id: assignments.id,
-        title: assignments.title,
-        description: assignments.description,
-        fileUrl: assignments.fileUrl,
-        dueDate: assignments.dueDate,
-        department: assignments.department,
-        year: assignments.year,
-        createdBy: assignments.createdBy,
-        createdAt: assignments.createdAt,
-        creatorId: users.id,
-        creatorName: users.name,
-        creatorEmail: users.email,
-        submissionCount: sql<number>`CAST(COUNT(DISTINCT ${submissions.id}) AS INTEGER)`,
-      })
-      .from(assignments)
-      .leftJoin(users, eq(assignments.createdBy, users.id))
-      .leftJoin(submissions, eq(assignments.id, submissions.assignmentId))
-      .groupBy(
-        assignments.id,
-        assignments.title,
-        assignments.description,
-        assignments.fileUrl,
-        assignments.dueDate,
-        assignments.department,
-        assignments.year,
-        assignments.createdBy,
-        assignments.createdAt,
-        users.id,
-        users.name,
-        users.email
-      )
-      .$dynamic();
-
-    // Apply filters based on role
-    const conditions = [];
+    // Build query filter for Mongoose
+    const filter: any = {};
 
     if (currentUser.role === 'student') {
       // Students only see assignments from their department
-      conditions.push(eq(assignments.department, currentUser.department));
+      filter.department = currentUser.department;
     } else {
       // Faculty/Admin can filter by department and year
       if (department) {
-        conditions.push(eq(assignments.department, department));
+        filter.department = department;
       }
       if (year) {
-        conditions.push(eq(assignments.year, year));
+        filter.year = year;
       }
     }
 
-    if (conditions.length > 0) {
-      query = query.where(and(...conditions));
-    }
-
-    // Order by due date (upcoming first) and apply pagination
-    const results = await query
-      .orderBy(asc(assignments.dueDate))
+    // Query assignments with populate for creator details
+    const assignments = await Assignment.find(filter)
+      .populate('createdBy', 'name email')
+      .sort({ dueDate: 1 })
+      .skip(offset)
       .limit(limit)
-      .offset(offset);
+      .lean()
+      .exec();
 
-    // Transform results to match response format
-    const formattedResults = results.map(row => ({
-      id: row.id,
-      title: row.title,
-      description: row.description,
-      fileUrl: row.fileUrl,
-      dueDate: row.dueDate,
-      department: row.department,
-      year: row.year,
-      createdBy: row.createdBy,
-      createdAt: row.createdAt,
-      creator: {
-        id: row.creatorId,
-        name: row.creatorName,
-        email: row.creatorEmail,
-      },
-      submissionCount: row.submissionCount || 0,
-    }));
+    // Get submission counts for each assignment
+    const resultsWithCounts = await Promise.all(
+      assignments.map(async (assignment: any) => {
+        const submissionCount = await Submission.countDocuments({ 
+          assignmentId: assignment._id 
+        }).exec();
 
-    return NextResponse.json(formattedResults, { status: 200 });
+        return {
+          id: assignment._id.toString(),
+          title: assignment.title,
+          description: assignment.description,
+          fileUrl: assignment.fileUrl,
+          dueDate: assignment.dueDate,
+          department: assignment.department,
+          year: assignment.year,
+          createdBy: assignment.createdBy._id.toString(),
+          createdAt: assignment.createdAt,
+          creator: {
+            id: assignment.createdBy._id.toString(),
+            name: assignment.createdBy.name,
+            email: assignment.createdBy.email,
+          },
+          submissionCount: submissionCount,
+        };
+      })
+    );
+
+    return NextResponse.json(resultsWithCounts, { status: 200 });
   } catch (error) {
     console.error('GET error:', error);
     return NextResponse.json({ 
@@ -152,6 +124,9 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     const user = verifyToken(request);
     if (!user) {
       return NextResponse.json({ 
@@ -160,20 +135,17 @@ export async function POST(request: NextRequest) {
       }, { status: 401 });
     }
 
-    // Get user details to check role
-    const userDetails = await db.select()
-      .from(users)
-      .where(eq(users.id, user.userId))
-      .limit(1);
+    // Get user details to check role using Mongoose
+    const userDetails = await User.findById(user.userId).exec();
 
-    if (userDetails.length === 0) {
+    if (!userDetails) {
       return NextResponse.json({ 
         error: 'User not found',
         code: 'USER_NOT_FOUND' 
       }, { status: 404 });
     }
 
-    const currentUser = userDetails[0];
+    const currentUser = userDetails;
 
     // Authorization: Only faculty can create assignments
     if (currentUser.role !== 'faculty') {
@@ -231,40 +203,42 @@ export async function POST(request: NextRequest) {
       }, { status: 400 });
     }
 
-    // Create assignment
-    const newAssignment = await db.insert(assignments)
-      .values({
-        title: title.trim(),
-        description: description.trim(),
-        fileUrl: fileUrl ? fileUrl.trim() : null,
-        dueDate: dueDate,
-        department: department.trim(),
-        year: year.trim(),
-        createdBy: user.userId,
-        createdAt: new Date().toISOString(),
-      })
-      .returning();
+    // Create assignment using Mongoose
+    const newAssignment = await Assignment.create({
+      title: title.trim(),
+      description: description.trim(),
+      fileUrl: fileUrl ? fileUrl.trim() : null,
+      dueDate: dueDate,
+      department: department.trim(),
+      year: year.trim(),
+      createdBy: user.userId,
+    });
 
-    if (newAssignment.length === 0) {
+    if (!newAssignment) {
       return NextResponse.json({ 
         error: 'Failed to create assignment',
         code: 'CREATION_FAILED' 
       }, { status: 500 });
     }
 
-    // Get creator details for response
-    const creatorInfo = await db.select({
-      id: users.id,
-      name: users.name,
-      email: users.email,
-    })
-      .from(users)
-      .where(eq(users.id, user.userId))
-      .limit(1);
+    // Populate creator info
+    await newAssignment.populate('createdBy', 'name email');
 
     const response = {
-      ...newAssignment[0],
-      creator: creatorInfo[0],
+      id: newAssignment._id.toString(),
+      title: newAssignment.title,
+      description: newAssignment.description,
+      fileUrl: newAssignment.fileUrl,
+      dueDate: newAssignment.dueDate,
+      department: newAssignment.department,
+      year: newAssignment.year,
+      createdBy: (newAssignment.createdBy as any)._id.toString(),
+      createdAt: newAssignment.createdAt,
+      creator: {
+        id: (newAssignment.createdBy as any)._id.toString(),
+        name: (newAssignment.createdBy as any).name,
+        email: (newAssignment.createdBy as any).email,
+      },
       submissionCount: 0,
     };
 

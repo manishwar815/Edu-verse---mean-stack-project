@@ -1,19 +1,23 @@
 import { NextRequest, NextResponse } from 'next/server';
 import jwt from 'jsonwebtoken';
-import { db } from '@/db';
-import { submissions, assignments, users } from '@/db/schema';
-import { eq, and } from 'drizzle-orm';
+import { connectDB } from '@/db/mongodb';
+import { Submission } from '@/db/models/Submission';
+import { Assignment } from '@/db/models/Assignment';
+import { User } from '@/db/models/User';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
 interface JWTPayload {
-  userId: number;
+  userId: string;
   email: string;
   role: string;
 }
 
 export async function POST(request: NextRequest) {
   try {
+    // Connect to MongoDB
+    await connectDB();
+
     // Extract and verify JWT token
     const authHeader = request.headers.get('authorization');
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -62,22 +66,10 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Validate assignmentId is a valid number
-    const parsedAssignmentId = parseInt(assignmentId.toString());
-    if (isNaN(parsedAssignmentId)) {
-      return NextResponse.json(
-        { error: 'Invalid assignment ID', code: 'INVALID_ASSIGNMENT_ID' },
-        { status: 400 }
-      );
-    }
+    // Verify assignment exists using Mongoose
+    const assignment = await Assignment.findById(assignmentId).exec();
 
-    // Verify assignment exists
-    const assignment = await db.select()
-      .from(assignments)
-      .where(eq(assignments.id, parsedAssignmentId))
-      .limit(1);
-
-    if (assignment.length === 0) {
+    if (!assignment) {
       return NextResponse.json(
         { error: 'Assignment not found', code: 'ASSIGNMENT_NOT_FOUND' },
         { status: 404 }
@@ -85,17 +77,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Check if student has already submitted this assignment
-    const existingSubmission = await db.select()
-      .from(submissions)
-      .where(
-        and(
-          eq(submissions.assignmentId, parsedAssignmentId),
-          eq(submissions.studentId, decoded.userId)
-        )
-      )
-      .limit(1);
+    const existingSubmission = await Submission.findOne({
+      assignmentId: assignmentId,
+      studentId: decoded.userId
+    }).exec();
 
-    if (existingSubmission.length > 0) {
+    if (existingSubmission) {
       return NextResponse.json(
         { error: 'You have already submitted this assignment', code: 'SUBMISSION_EXISTS' },
         { status: 409 }
@@ -103,12 +90,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Get authenticated user's department
-    const user = await db.select()
-      .from(users)
-      .where(eq(users.id, decoded.userId))
-      .limit(1);
+    const user = await User.findById(decoded.userId).exec();
 
-    if (user.length === 0) {
+    if (!user) {
       return NextResponse.json(
         { error: 'User not found', code: 'USER_NOT_FOUND' },
         { status: 404 }
@@ -116,40 +100,37 @@ export async function POST(request: NextRequest) {
     }
 
     // Verify assignment is from student's department
-    if (assignment[0].department !== user[0].department) {
+    if (assignment.department !== user.department) {
       return NextResponse.json(
         { error: 'You can only submit assignments from your department', code: 'DEPARTMENT_MISMATCH' },
         { status: 403 }
       );
     }
 
-    // Create submission
+    // Create submission using Mongoose
     const currentTimestamp = new Date().toISOString();
-    const newSubmission = await db.insert(submissions)
-      .values({
-        assignmentId: parsedAssignmentId,
-        studentId: decoded.userId,
-        fileUrl: fileUrl.trim(),
-        submittedAt: currentTimestamp,
-        feedback: null,
-        createdAt: currentTimestamp,
-      })
-      .returning();
+    const newSubmission = await Submission.create({
+      assignmentId: assignmentId,
+      studentId: decoded.userId,
+      fileUrl: fileUrl.trim(),
+      submittedAt: currentTimestamp,
+      feedback: null,
+    });
 
     // Return created submission with assignment details
     return NextResponse.json(
       {
-        id: newSubmission[0].id,
-        assignmentId: newSubmission[0].assignmentId,
-        studentId: newSubmission[0].studentId,
-        fileUrl: newSubmission[0].fileUrl,
-        submittedAt: newSubmission[0].submittedAt,
-        feedback: newSubmission[0].feedback,
-        createdAt: newSubmission[0].createdAt,
+        id: newSubmission._id.toString(),
+        assignmentId: newSubmission.assignmentId,
+        studentId: newSubmission.studentId,
+        fileUrl: newSubmission.fileUrl,
+        submittedAt: newSubmission.submittedAt,
+        feedback: newSubmission.feedback,
+        createdAt: newSubmission.createdAt,
         assignment: {
-          title: assignment[0].title,
-          dueDate: assignment[0].dueDate,
-          department: assignment[0].department,
+          title: assignment.title,
+          dueDate: assignment.dueDate,
+          department: assignment.department,
         },
       },
       { status: 201 }
